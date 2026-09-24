@@ -81,6 +81,14 @@ CHECKIN_REQUIRE_PHOTO = os.environ.get("CHECKIN_REQUIRE_PHOTO", "").strip().lowe
 # ข้อความยาวเกินนี้ในกลุ่มเช็คชื่อ ถือว่าเป็นการคุย ไม่ใช่เช็คชื่อ
 CHECKIN_MAX_LEN = int(os.environ.get("CHECKIN_MAX_LEN", "200"))
 
+# เวลาจำกัดของแต่ละกิจกรรม (วินาที) — ต้องตรงกับ OVERTIME_LIMITS ในหน้าแดชบอร์ดและในกระดิ่งทอง
+OVERTIME_LIMITS = {"ปวดหนัก": 20 * 60, "ปวดน้อย": 6 * 60, "กินข้าว": 30 * 60}
+AT_SEAT = "กลับที่นั่ง"
+
+# สถิติรายวันตัดรอบกี่โมง (เวลาไทย) — 02:00 เพราะกะดึกเลิก 08:00 ถ้าตัดเที่ยงคืนกะเดียวจะโดนหั่นเป็นสองวัน
+DAY_RESET_HOUR = int(os.environ.get("DAY_RESET_HOUR", "2"))
+DAILY_STATS_TTL = float(os.environ.get("DAILY_STATS_TTL", "10"))  # cache กี่วินาที (กันยิงถี่จนกิน DB)
+
 # ชื่อที่ลงท้ายด้วยคำพวกนี้ ไม่ใช่พนักงานของเรา ให้กรองออก
 EXCLUDED_SUFFIXES = [
     "Vv72", "PG688", "Jun88", "MK8", "JL69",
@@ -1130,6 +1138,169 @@ def api_tts():
         return jsonify({"error": f"ElevenLabs ตอบผิดพลาด ({resp.status_code}): {resp.text[:200]}"}), 502
 
     return Response(resp.content, mimetype="audio/mpeg")
+
+
+# ===== สถิติรายวัน (ตัดรอบ 02:00) — ใช้โดยโปรแกรมกระดิ่งทอง ฝั่งพนักงาน/แอดมิน =====
+
+def day_window(day=None):
+    """คืน (เริ่ม UTC, จบ UTC, วันที่) ของ 'วันทำงาน' หนึ่งวัน ที่ตัดรอบตอน DAY_RESET_HOUR น. เวลาไทย
+    ไม่ระบุ day = วันทำงานปัจจุบัน (ก่อน 02:00 ยังนับเป็นของเมื่อวาน)"""
+    if day:
+        d = datetime.strptime(day, "%Y-%m-%d").date()
+    else:
+        d = (datetime.now(BANGKOK_TZ) - timedelta(hours=DAY_RESET_HOUR)).date()
+    start_bkk = datetime.combine(d, datetime.min.time(), tzinfo=BANGKOK_TZ) + timedelta(hours=DAY_RESET_HOUR)
+    end_bkk = start_bkk + timedelta(days=1)
+    return start_bkk.astimezone(timezone.utc), end_bkk.astimezone(timezone.utc), d.isoformat()
+
+
+def _empty_stat():
+    return {"count": 0, "seconds": 0, "over_count": 0, "over_seconds": 0}
+
+
+def build_daily_stats(cur, day=None):
+    """สรุปต่อคนว่าวันนี้ออกไปกิจกรรมไหนกี่ครั้ง รวมกี่วินาที และเกินเวลากี่ครั้ง
+
+    กติกาที่ใช้ (ตั้งใจให้ตรงกับที่คนเข้าใจ ไม่ใช่ที่ SQL ทำง่าย):
+    - "กี่ครั้ง" นับตอนที่ *เริ่มออก* ในวันนี้ — คนที่ออกตั้งแต่เมื่อวานแล้วเพิ่งกลับตอนตี 3 ไม่ถูกนับซ้ำ
+    - "กี่วินาที" นับเฉพาะส่วนที่อยู่ในวันนี้ — ครึ่งที่ล้ำมาจากเมื่อวานเป็นของเมื่อวาน
+    - "เกินเวลา" ตัดสินจากความยาวจริงของรอบนั้นทั้งรอบ ไม่ใช่เฉพาะส่วนที่อยู่ในวันนี้
+    - รอบที่ยังไม่กดกลับที่นั่ง นับเวลาถึง 'ตอนนี้' และรายงานแยกไว้ที่ current ด้วย"""
+    start, end, day_str = day_window(day)
+    now = datetime.now(timezone.utc)
+    cap = min(now, end)  # วันนี้ยังไม่จบ — นับได้แค่ถึงตอนนี้
+
+    cur.execute(
+        """
+        SELECT user_id, username, activity, timestamp FROM status_log
+        WHERE timestamp >= %s AND timestamp < %s
+        """ + EXCLUDE_SQL + """
+        ORDER BY user_id, timestamp ASC
+        """,
+        (start, end) + EXCLUDE_PARAMS,
+    )
+    rows = cur.fetchall()
+
+    # คนที่ออกไปตั้งแต่ก่อนรอบวันนี้เริ่ม แล้วยังไม่กดกลับที่นั่ง — เวลาส่วนที่ล้ำเข้ามาในวันนี้ต้องนับด้วย
+    cur.execute(
+        """
+        SELECT DISTINCT ON (user_id) user_id, username, activity, timestamp FROM status_log
+        WHERE timestamp < %s
+        """ + EXCLUDE_SQL + """
+        ORDER BY user_id, timestamp DESC
+        """,
+        (start,) + EXCLUDE_PARAMS,
+    )
+    carried = {r["user_id"]: r for r in cur.fetchall() if r["activity"] != AT_SEAT}
+
+    by_user = defaultdict(list)
+    for r in rows:
+        by_user[r["user_id"]].append(r)
+
+    people = {}
+
+    def rec_for(uid, name):
+        rec = people.get(uid)
+        if rec is None:
+            rec = people[uid] = {
+                "user_id": uid, "username": name or "", "category": get_category(name or ""),
+                "activities": {a: _empty_stat() for a in ACTIVITIES},
+                "total_count": 0, "total_seconds": 0,
+                "over_count": 0, "over_seconds": 0, "current": None,
+            }
+        if name and name != rec["username"]:
+            rec["username"] = name
+            rec["category"] = get_category(name)
+        return rec
+
+    def close_session(rec, activity, began, ended):
+        """ปิดรอบหนึ่งแล้วบวกเข้าสถิติ — began คือเวลาที่ออกจริง (อาจอยู่ก่อนต้นวัน)"""
+        full = int((ended - began).total_seconds())
+        inside = int((ended - max(began, start)).total_seconds())
+        if full < 0 or inside <= 0:
+            return
+        st = rec["activities"].setdefault(activity, _empty_stat())
+        st["seconds"] += inside
+        rec["total_seconds"] += inside
+        if began >= start:  # เริ่มออกในวันนี้ถึงจะนับเป็น 1 ครั้งของวันนี้
+            st["count"] += 1
+            rec["total_count"] += 1
+        limit = OVERTIME_LIMITS.get(activity)
+        if limit and full > limit:
+            over = full - limit
+            st["over_count"] += 1
+            st["over_seconds"] += over
+            rec["over_count"] += 1
+            rec["over_seconds"] += over
+
+    for uid in set(by_user) | set(carried):
+        head = carried.get(uid)
+        name = (head or {}).get("username") or ""
+        open_act = (head or {}).get("activity")
+        open_since = (head or {}).get("timestamp")
+        rec = rec_for(uid, name)
+
+        for r in by_user.get(uid, []):
+            rec = rec_for(uid, r["username"])
+            if open_act:
+                close_session(rec, open_act, open_since, r["timestamp"])
+            if r["activity"] == AT_SEAT:
+                open_act, open_since = None, None
+            else:
+                open_act, open_since = r["activity"], r["timestamp"]
+
+        if open_act:
+            close_session(rec, open_act, open_since, cap)
+            limit = OVERTIME_LIMITS.get(open_act)
+            elapsed = int((cap - open_since).total_seconds())
+            rec["current"] = {
+                "activity": open_act,
+                "since": open_since.isoformat(),
+                "seconds": max(0, elapsed),
+                "limit": limit,
+                "over": bool(limit and elapsed > limit),
+            }
+
+    return {
+        "day": day_str,
+        "reset_hour": DAY_RESET_HOUR,
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "now": now.isoformat(),
+        "activities": ACTIVITIES,
+        "limits": {a: OVERTIME_LIMITS.get(a) for a in ACTIVITIES},
+        "people": sorted(people.values(), key=lambda p: p["total_seconds"], reverse=True),
+    }
+
+
+_daily_cache = {}  # {วันที่: (เวลาที่ทำ, ผลลัพธ์)} — กันหลายเครื่องยิงถี่ๆ พร้อมกันจนกิน DB
+_daily_lock = threading.Lock()
+
+
+@app.route("/api/daily-stats")
+def api_daily_stats():
+    """สถิติรายวันของทุกคน (ตัดรอบ 02:00) — กระดิ่งทองดึงไปแสดงในโปรแกรมพนักงาน/แอดมิน"""
+    day = (request.args.get("day") or "").strip() or None
+    if day and not re.match(r"^\d{4}-\d{2}-\d{2}$", day):
+        return jsonify({"error": "day ต้องเป็นรูปแบบ YYYY-MM-DD"}), 400
+
+    now_ts = time.time()
+    with _daily_lock:
+        hit = _daily_cache.get(day or "")
+        if hit and now_ts - hit[0] < DAILY_STATS_TTL:
+            return jsonify(hit[1])
+
+    try:
+        with db() as cur:
+            data = build_daily_stats(cur, day)
+    except ValueError:
+        return jsonify({"error": "day ไม่ถูกต้อง"}), 400
+
+    with _daily_lock:
+        if len(_daily_cache) > 40:
+            _daily_cache.clear()  # ขอย้อนหลังหลายวันจนบวมก็ล้างทิ้ง เริ่มใหม่
+        _daily_cache[day or ""] = (now_ts, data)
+    return jsonify(data)
 
 
 def build_activity_detail(cur, activity, category, shift_override=None):
