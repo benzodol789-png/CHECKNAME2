@@ -85,8 +85,10 @@ CHECKIN_MAX_LEN = int(os.environ.get("CHECKIN_MAX_LEN", "200"))
 OVERTIME_LIMITS = {"ปวดหนัก": 20 * 60, "ปวดน้อย": 6 * 60, "กินข้าว": 30 * 60}
 AT_SEAT = "กลับที่นั่ง"
 
-# สถิติรายวันตัดรอบกี่โมง (เวลาไทย) — 02:00 เพราะกะดึกเลิก 08:00 ถ้าตัดเที่ยงคืนกะเดียวจะโดนหั่นเป็นสองวัน
-DAY_RESET_HOUR = int(os.environ.get("DAY_RESET_HOUR", "2"))
+# รอบกะสำหรับสถิติ (เวลาไทย) — ตรงกับที่ระบบของเจ้าของบอทรีเซ็ตโควตา: 08:00-20:00 และ 20:00-08:00
+SHIFT_DAY_HOUR = int(os.environ.get("SHIFT_DAY_HOUR", "8"))
+SHIFT_NIGHT_HOUR = int(os.environ.get("SHIFT_NIGHT_HOUR", "20"))
+SHIFT_LENGTH_HOURS = SHIFT_NIGHT_HOUR - SHIFT_DAY_HOUR  # กะละ 12 ชม.
 DAILY_STATS_TTL = float(os.environ.get("DAILY_STATS_TTL", "10"))  # cache กี่วินาที (กันยิงถี่จนกิน DB)
 
 # ชื่อที่ลงท้ายด้วยคำพวกนี้ ไม่ใช่พนักงานของเรา ให้กรองออก
@@ -1140,35 +1142,58 @@ def api_tts():
     return Response(resp.content, mimetype="audio/mpeg")
 
 
-# ===== สถิติรายวัน (ตัดรอบ 02:00) — ใช้โดยโปรแกรมกระดิ่งทอง ฝั่งพนักงาน/แอดมิน =====
+# ===== สถิติรายกะ — ใช้โดยโปรแกรมกระดิ่งทอง ฝั่งพนักงาน/แอดมิน =====
+# ระบบของเจ้าของบอทรีเซ็ตโควตา 2 รอบต่อวัน (08:00-20:00 และ 20:00-08:00) สถิติฝั่งเราจึงนับตามรอบกะ
+# ให้ตรงกัน — และกะดึกไม่ถูกหั่นครึ่งเหมือนตอนที่เคยตัดรอบตอนตี 2
+ZERO_TIME = {"minute": 0, "second": 0, "microsecond": 0}
+THAI_MONTHS = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.",
+               "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."]
 
-def day_window(day=None):
-    """คืน (เริ่ม UTC, จบ UTC, วันที่) ของ 'วันทำงาน' หนึ่งวัน ที่ตัดรอบตอน DAY_RESET_HOUR น. เวลาไทย
-    ไม่ระบุ day = วันทำงานปัจจุบัน (ก่อน 02:00 ยังนับเป็นของเมื่อวาน)"""
+
+def shift_window(day=None, shift=None):
+    """คืน (เริ่ม UTC, จบ UTC, ข้อมูลกะ) ของรอบกะ — ไม่ระบุอะไรเลย = กะที่กำลังทำงานอยู่ตอนนี้"""
     if day:
         d = datetime.strptime(day, "%Y-%m-%d").date()
+        which = shift if shift in ("เช้า", "ดึก") else "เช้า"
+        start_bkk = (datetime.combine(d, datetime.min.time(), tzinfo=BANGKOK_TZ)
+                     + timedelta(hours=SHIFT_DAY_HOUR if which == "เช้า" else SHIFT_NIGHT_HOUR))
     else:
-        d = (datetime.now(BANGKOK_TZ) - timedelta(hours=DAY_RESET_HOUR)).date()
-    start_bkk = datetime.combine(d, datetime.min.time(), tzinfo=BANGKOK_TZ) + timedelta(hours=DAY_RESET_HOUR)
-    end_bkk = start_bkk + timedelta(days=1)
-    return start_bkk.astimezone(timezone.utc), end_bkk.astimezone(timezone.utc), d.isoformat()
+        now_bkk = datetime.now(BANGKOK_TZ)
+        if now_bkk.hour < SHIFT_DAY_HOUR:       # ก่อน 08:00 = ยังอยู่ในกะดึกที่เริ่มเมื่อวานสองทุ่ม
+            start_bkk = (now_bkk - timedelta(days=1)).replace(hour=SHIFT_NIGHT_HOUR, **ZERO_TIME)
+            which = "ดึก"
+        elif now_bkk.hour < SHIFT_NIGHT_HOUR:   # 08:00-19:59 = กะเช้า
+            start_bkk = now_bkk.replace(hour=SHIFT_DAY_HOUR, **ZERO_TIME)
+            which = "เช้า"
+        else:                                    # 20:00 เป็นต้นไป = กะดึกของคืนนี้
+            start_bkk = now_bkk.replace(hour=SHIFT_NIGHT_HOUR, **ZERO_TIME)
+            which = "ดึก"
+    end_bkk = start_bkk + timedelta(hours=SHIFT_LENGTH_HOURS)
+    info = {
+        "day": start_bkk.date().isoformat(),
+        "shift": which,
+        "shift_label": f"กะ{which} {start_bkk:%H:%M}-{end_bkk:%H:%M}",
+        "day_short": f"{start_bkk.day} {THAI_MONTHS[start_bkk.month - 1]}",
+        "reset_hour": start_bkk.hour,  # โปรแกรมรุ่นเก่าอ่านค่านี้ไปแสดงเวลารีเซ็ต
+    }
+    return start_bkk.astimezone(timezone.utc), end_bkk.astimezone(timezone.utc), info
 
 
 def _empty_stat():
     return {"count": 0, "seconds": 0, "over_count": 0, "over_seconds": 0}
 
 
-def build_daily_stats(cur, day=None):
-    """สรุปต่อคนว่าวันนี้ออกไปกิจกรรมไหนกี่ครั้ง รวมกี่วินาที และเกินเวลากี่ครั้ง
+def build_daily_stats(cur, day=None, shift=None):
+    """สรุปต่อคนว่ากะนี้ออกไปกิจกรรมไหนกี่ครั้ง รวมกี่วินาที และเกินเวลากี่ครั้ง
 
     กติกาที่ใช้ (ตั้งใจให้ตรงกับที่คนเข้าใจ ไม่ใช่ที่ SQL ทำง่าย):
-    - "กี่ครั้ง" นับตอนที่ *เริ่มออก* ในวันนี้ — คนที่ออกตั้งแต่เมื่อวานแล้วเพิ่งกลับตอนตี 3 ไม่ถูกนับซ้ำ
-    - "กี่วินาที" นับเฉพาะส่วนที่อยู่ในวันนี้ — ครึ่งที่ล้ำมาจากเมื่อวานเป็นของเมื่อวาน
-    - "เกินเวลา" ตัดสินจากความยาวจริงของรอบนั้นทั้งรอบ ไม่ใช่เฉพาะส่วนที่อยู่ในวันนี้
+    - "กี่ครั้ง" นับตอนที่ *เริ่มออก* ในกะนี้ — คนที่ออกตั้งแต่กะก่อนแล้วเพิ่งกลับ ไม่ถูกนับซ้ำ
+    - "กี่วินาที" นับเฉพาะส่วนที่อยู่ในกะนี้ — ครึ่งที่ล้ำมาจากกะก่อนเป็นของกะก่อน
+    - "เกินเวลา" ตัดสินจากความยาวจริงของรอบนั้นทั้งรอบ ไม่ใช่เฉพาะส่วนที่อยู่ในกะนี้
     - รอบที่ยังไม่กดกลับที่นั่ง นับเวลาถึง 'ตอนนี้' และรายงานแยกไว้ที่ current ด้วย"""
-    start, end, day_str = day_window(day)
+    start, end, info = shift_window(day, shift)
     now = datetime.now(timezone.utc)
-    cap = min(now, end)  # วันนี้ยังไม่จบ — นับได้แค่ถึงตอนนี้
+    cap = min(now, end)  # กะนี้ยังไม่จบ — นับได้แค่ถึงตอนนี้
 
     cur.execute(
         """
@@ -1261,45 +1286,50 @@ def build_daily_stats(cur, day=None):
                 "over": bool(limit and elapsed > limit),
             }
 
-    return {
-        "day": day_str,
-        "reset_hour": DAY_RESET_HOUR,
+    out = dict(info)  # day / shift / shift_label / day_short / reset_hour
+    out.update({
         "start": start.isoformat(),
         "end": end.isoformat(),
         "now": now.isoformat(),
         "activities": ACTIVITIES,
         "limits": {a: OVERTIME_LIMITS.get(a) for a in ACTIVITIES},
         "people": sorted(people.values(), key=lambda p: p["total_seconds"], reverse=True),
-    }
+    })
+    return out
 
 
-_daily_cache = {}  # {วันที่: (เวลาที่ทำ, ผลลัพธ์)} — กันหลายเครื่องยิงถี่ๆ พร้อมกันจนกิน DB
+_daily_cache = {}  # {(วันที่, กะ): (เวลาที่ทำ, ผลลัพธ์)} — กันหลายเครื่องยิงถี่ๆ พร้อมกันจนกิน DB
 _daily_lock = threading.Lock()
 
 
 @app.route("/api/daily-stats")
 def api_daily_stats():
-    """สถิติรายวันของทุกคน (ตัดรอบ 02:00) — กระดิ่งทองดึงไปแสดงในโปรแกรมพนักงาน/แอดมิน"""
+    """สถิติของทุกคนในรอบกะ (08:00-20:00 / 20:00-08:00) — กระดิ่งทองดึงไปแสดงในโปรแกรม
+    ไม่ใส่พารามิเตอร์ = กะที่กำลังทำงานอยู่ / ใส่ day=YYYY-MM-DD&shift=เช้า|ดึก เพื่อขอย้อนหลัง"""
     day = (request.args.get("day") or "").strip() or None
+    shift = (request.args.get("shift") or "").strip() or None
     if day and not re.match(r"^\d{4}-\d{2}-\d{2}$", day):
         return jsonify({"error": "day ต้องเป็นรูปแบบ YYYY-MM-DD"}), 400
+    if shift and shift not in ("เช้า", "ดึก"):
+        return jsonify({"error": "shift ต้องเป็น เช้า หรือ ดึก"}), 400
 
+    key = (day or "", shift or "")
     now_ts = time.time()
     with _daily_lock:
-        hit = _daily_cache.get(day or "")
+        hit = _daily_cache.get(key)
         if hit and now_ts - hit[0] < DAILY_STATS_TTL:
             return jsonify(hit[1])
 
     try:
         with db() as cur:
-            data = build_daily_stats(cur, day)
+            data = build_daily_stats(cur, day, shift)
     except ValueError:
         return jsonify({"error": "day ไม่ถูกต้อง"}), 400
 
     with _daily_lock:
         if len(_daily_cache) > 40:
-            _daily_cache.clear()  # ขอย้อนหลังหลายวันจนบวมก็ล้างทิ้ง เริ่มใหม่
-        _daily_cache[day or ""] = (now_ts, data)
+            _daily_cache.clear()  # ขอย้อนหลังหลายกะจนบวมก็ล้างทิ้ง เริ่มใหม่
+        _daily_cache[key] = (now_ts, data)
     return jsonify(data)
 
 
